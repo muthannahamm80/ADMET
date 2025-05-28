@@ -3,33 +3,33 @@ from chembl_webresource_client.new_client import new_client
 from rdkit import Chem
 import time
 
-# Initialize clients
+# Initialize Clients
 activity = new_client.activity
 molecule = new_client.molecule
 
-# Targets for hERG and CYP3A4
+# Target IDs for hERG and CYP3A4
 targets = {
     'herg': 'CHEMBL203',      # hERG
     'cyp3a4': 'CHEMBL1569'    # CYP3A4
 }
 
-def fetch_activities(target_chembl_id, max_records=1500):
+def fetch_activities_for_target(target_chembl_id, max_records=1500):
     """
-    Fetch activities from ChEMBL and filter in Python by target.
+    Fetch all activities, then filter by target_chembl_id in Python.
     """
-    activities = list(activity.filter())  # fetch all activities
+    print(f"Fetching all activities for target CHEMBL ID: {target_chembl_id} ...")
+    all_activities = list(activity.filter())  # fetch all activities
     filtered = []
-
     count = 0
-    for act in activities:
+    for act in all_activities:
         try:
             target_info = act.get('target')
-            # 'target' can be a dict; check its 'chembl_id'
+            # 'target' can be a dict containing 'chembl_id'
             if isinstance(target_info, dict):
                 if target_info.get('chembl_id') != target_chembl_id:
                     continue
             else:
-                continue  # skip if no target info or mismatch
+                continue  # skip if no target info
 
             chembl_id = act['molecule_chembl_id']
             smi = molecule.get(chembl_id).get('molecule_structures', {}).get('canonical_smiles', None)
@@ -40,8 +40,9 @@ def fetch_activities(target_chembl_id, max_records=1500):
             if std_value is None:
                 continue
             val = float(std_value)
+            # Convert pX to μM if needed
             if std_type and 'p' in std_type:
-                val = 10 ** (-val)  # convert pIC50 etc. to μM
+                val = 10 ** (-val)
             filtered.append({
                 'chembl_id': chembl_id,
                 'canonical_smiles': smi,
@@ -50,24 +51,26 @@ def fetch_activities(target_chembl_id, max_records=1500):
             })
             count += 1
             if count % 100 == 0:
-                print(f"Collected {count} records for target {target_chembl_id}...")
+                print(f"Collected {count} activities for target {target_chembl_id} ...")
             if count >= max_records:
                 break
         except:
             continue
-    print(f"Total for {target_chembl_id}: {count}")
+    print(f"Total for target {target_chembl_id}: {count} activities.")
     return filtered
 
 # Fetch data for both targets
-data = []
-for name, t_id in targets.items():
-    data.extend(fetch_activities(t_id))
-    time.sleep(1)
+all_data = []
 
-# Create DataFrame
-df = pd.DataFrame(data)
+for target_name, target_id in targets.items():
+    data = fetch_activities_for_target(target_id)
+    all_data.extend(data)
+    time.sleep(1)  # pause between targets
 
-# Clean SMILES: keep only the first part (remove salts)
+# Convert to DataFrame
+df = pd.DataFrame(all_data)
+
+# Remove salts: keep main structure
 df['canonical_smiles'] = df['canonical_smiles'].apply(lambda s: s.split('.')[0] if s else None)
 
 # Validate SMILES
@@ -80,16 +83,13 @@ def is_valid_smile(s):
 df = df[df['canonical_smiles'].apply(is_valid_smile)]
 
 # Find molecules with both targets
-grouped = df.groupby('chembl_id')
-common_ids = [
-    cid for cid, g in grouped
-    if set(g['endpoint']) == {'herg', 'cyp3a4'}
-]
+groups = df.groupby('chembl_id')
+common_ids = [cid for cid, g in groups if set(g['endpoint']) == {'herg', 'cyp3a4'}]
 
 # Limit to 300 compounds
 selected_ids = common_ids[:300]
 final_df = df[df['chembl_id'].isin(selected_ids)]
 
-# Save result
+# Save dataset
 final_df.to_csv('dataset.csv', index=False)
 print("dataset.csv has been generated.")
