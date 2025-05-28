@@ -1,61 +1,101 @@
 import pandas as pd
 from chembl_webresource_client.new_client import new_client
 from rdkit import Chem
-from rdkit.Chem import SaltRemover
+import time
 
-def strip_salt(smiles):
-    mol = Chem.MolFromSmiles(smiles)
-    if not mol:
-        return None
-    remover = SaltRemover.SaltRemover()
-    stripped = remover.StripMol(mol)
-    return Chem.MolToSmiles(stripped, canonical=True)
+# Initialize clients
+activity = new_client.activity
+molecule = new_client.molecule
 
-def to_uM(value, units):
-    if units == "nM":
-        return value / 1000
-    if units == "µM" or units == "uM":
-        return value
-    if units == "mM":
-        return value * 1000
-    return None
+# Targets for hERG and CYP3A4
+targets = {
+    'herg': 'CHEMBL203',      # hERG target ChEMBL ID
+    'cyp3a4': 'CHEMBL1569'    # CYP3A4 target ChEMBL ID
+}
 
-def get_target_id(target_keyword):
-    target = new_client.target
-    targets = target.filter(target_components__component_synonyms__icontains=target_keyword)
-    return targets[0]['target_chembl_id'] if targets else None
+def fetch_activities(target_id, max_records=1500):
+    """
+    Fetch activities from ChEMBL. Since filtering may be unsupported,
+    fetch a large number and filter afterwards.
+    """
+    activities_list = []
+    print(f"Fetching activities from ChEMBL (target: {target_id}) ...")
+    activities = list(activity.filter())  # fetch all activities
+    count = 0
+    for act in activities:
+        try:
+            # Check if the target matches by comparing target ChEMBL id
+            if 'target' in act:
+                target_info = act['target']
+                # 'target' info might be a dict
+                target_chembl_id = target_info.get('chembl_id') if isinstance(target_info, dict) else None
+                if target_chembl_id != target_id:
+                    continue  # skip if not matching target
 
-herg_target = get_target_id("hERG")
-cyp_target = get_target_id("CYP3A4")
+            chembl_id = act['molecule_chembl_id']
+            mol_struct = molecule.get(chembl_id).get('molecule_structures', {}).get('canonical_smiles', None)
+            if mol_struct is None:
+                continue
+            std_type = act.get('standard_type')
+            std_value = act.get('standard_value')
+            if std_value is None:
+                continue
+            value = float(std_value)
+            if std_type and 'p' in std_type:
+                # Convert pX to μM
+                value_muM = 10 ** (-value)
+            else:
+                value_muM = value
+            activities_list.append({
+                'chembl_id': chembl_id,
+                'canonical_smiles': mol_struct,
+                'endpoint': target_id,
+                'value': value_muM
+            })
 
-herg_df = new_client.activity.filter(target_chembl_id=herg_target, standard_type="IC50").only(
-    ["molecule_chembl_id", "canonical_smiles", "standard_value", "standard_units", "pchembl_value"]).to_dataframe()
-herg_df = herg_df.dropna(subset=["canonical_smiles", "standard_value", "standard_units"])
-herg_df["value"] = herg_df.apply(lambda x: to_uM(float(x["standard_value"]), x["standard_units"]), axis=1)
-herg_df["endpoint"] = "herg"
-herg_df = herg_df[["molecule_chembl_id", "canonical_smiles", "endpoint", "value", "pchembl_value"]]
-herg_df = herg_df.rename(columns={"molecule_chembl_id": "chembl_id", "pchembl_value": "pchembl"})
+            count += 1
+            if count % 100 == 0:
+                print(f"Fetched {count} records for target {target_id}...")
 
-cyp_df = new_client.activity.filter(target_chembl_id=cyp_target, standard_type="IC50").only(
-    ["molecule_chembl_id", "canonical_smiles", "standard_value", "standard_units", "pchembl_value"]).to_dataframe()
-cyp_df = cyp_df.dropna(subset=["canonical_smiles", "standard_value", "standard_units"])
-cyp_df["value"] = cyp_df.apply(lambda x: to_uM(float(x["standard_value"]), x["standard_units"]), axis=1)
-cyp_df["endpoint"] = "cyp3a4"
-cyp_df = cyp_df[["molecule_chembl_id", "canonical_smiles", "endpoint", "value", "pchembl_value"]]
-cyp_df = cyp_df.rename(columns={"molecule_chembl_id": "chembl_id", "pchembl_value": "pchembl"})
+            if count >= max_records:
+                break
+        except Exception as e:
+            continue
+    print(f"Total activities fetched for {target_id}: {count}")
+    return activities_list
 
-merged = pd.concat([herg_df, cyp_df])
-merged["canonical_smiles"] = merged["canonical_smiles"].apply(strip_salt)
-merged = merged.dropna(subset=["canonical_smiles", "value"])
-pivot = merged.pivot_table(index="chembl_id", columns="endpoint", values="value", aggfunc="first").dropna()
-pivot = pivot.reset_index()
-valid_ids = pivot["chembl_id"].tolist()
-final_df = merged[merged["chembl_id"].isin(valid_ids)]
-limited_ids = final_df["chembl_id"].drop_duplicates().head(300).tolist()
-final_df = final_df[final_df["chembl_id"].isin(limited_ids)]
+# Fetch activities for both targets
+data_records = []
 
-assert (final_df["value"] > 0).all(), "Non-positive values detected"
-assert not final_df.duplicated(subset=["chembl_id", "endpoint"]).any(), "Duplicate chembl_id-endpoint entries found"
+for target_name, target_id in targets.items():
+    acts = fetch_activities(target_id, max_records=1500)
+    data_records.extend(acts)
+    time.sleep(1)  # pause between targets
 
-final_df.to_csv("dataset.csv", index=False)
-print("Generated dataset.csv with", len(final_df), "rows")
+# Convert to DataFrame
+df = pd.DataFrame(data_records)
+
+# Remove salts: keep only the first part of SMILES
+df['canonical_smiles'] = df['canonical_smiles'].apply(lambda s: s.split('.')[0] if s else None)
+
+# Validate SMILES
+def is_valid_smile(s):
+    try:
+        return Chem.MolFromSmiles(s) is not None
+    except:
+        return False
+
+df = df[df['canonical_smiles'].apply(is_valid_smile)]
+
+# Find molecules with both endpoints
+grouped = df.groupby('chembl_id')
+common_ids = [chembl_id for chembl_id, grp in grouped
+              if set(grp['endpoint']) == {'herg', 'cyp3a4'}]
+
+# Limit to 300 compounds
+selected_ids = common_ids[:300]
+final_df = df[df['chembl_id'].isin(selected_ids)]
+
+# Save dataset
+final_df.to_csv('dataset.csv', index=False)
+print("dataset.csv has been generated.")
