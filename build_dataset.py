@@ -7,30 +7,28 @@ import time
 activity = new_client.activity
 molecule = new_client.molecule
 
-# Targets for hERG and CYP3A4
+# ChEMBL target IDs
 targets = {
-    'herg': 'CHEMBL203',      # hERG target ChEMBL ID
-    'cyp3a4': 'CHEMBL1569'    # CYP3A4 target ChEMBL ID
+    'herg': 'CHEMBL203',      # hERG
+    'cyp3a4': 'CHEMBL1569'    # CYP3A4
 }
 
 def fetch_activities(target_id, max_records=1500):
-    """
-    Fetch activities from ChEMBL. Since filtering may be unsupported,
-    fetch a large number and filter afterwards.
-    """
     activities_list = []
-    print(f"Fetching activities from ChEMBL (target: {target_id}) ...")
-    activities = list(activity.filter())  # fetch all activities
+    print(f"Fetching activities for target: {target_id}")
+    all_activities = list(activity.filter())  # fetch all activities
     count = 0
-    for act in activities:
+    for act in all_activities:
         try:
-            # Check if the target matches by comparing target ChEMBL id
-            if 'target' in act:
-                target_info = act['target']
-                # 'target' info might be a dict
-                target_chembl_id = target_info.get('chembl_id') if isinstance(target_info, dict) else None
-                if target_chembl_id != target_id:
-                    continue  # skip if not matching target
+            # Check the 'target' attribute
+            target_info = act.get('target')
+            # 'target' may be a dict with 'chembl_id'
+            target_chembl_id = None
+            if isinstance(target_info, dict):
+                target_chembl_id = target_info.get('chembl_id')
+            # Filter manually: process only if target matches
+            if target_chembl_id != target_id:
+                continue
 
             chembl_id = act['molecule_chembl_id']
             mol_struct = molecule.get(chembl_id).get('molecule_structures', {}).get('canonical_smiles', None)
@@ -42,7 +40,6 @@ def fetch_activities(target_id, max_records=1500):
                 continue
             value = float(std_value)
             if std_type and 'p' in std_type:
-                # Convert pX to μM
                 value_muM = 10 ** (-value)
             else:
                 value_muM = value
@@ -52,30 +49,28 @@ def fetch_activities(target_id, max_records=1500):
                 'endpoint': target_id,
                 'value': value_muM
             })
-
             count += 1
             if count % 100 == 0:
-                print(f"Fetched {count} records for target {target_id}...")
-
+                print(f"Collected {count} activities for {target_id}")
             if count >= max_records:
                 break
-        except Exception as e:
+        except Exception:
             continue
-    print(f"Total activities fetched for {target_id}: {count}")
+    print(f"Finished fetching {count} activities for {target_id}")
     return activities_list
 
-# Fetch activities for both targets
-data_records = []
+# Fetch data for both targets with filter
+data = []
 
 for target_name, target_id in targets.items():
-    acts = fetch_activities(target_id, max_records=1500)
-    data_records.extend(acts)
-    time.sleep(1)  # pause between targets
+    acts = fetch_activities(target_id)
+    data.extend(acts)
+    time.sleep(1)
 
 # Convert to DataFrame
-df = pd.DataFrame(data_records)
+df = pd.DataFrame(data)
 
-# Remove salts: keep only the first part of SMILES
+# Cleanup SMILES
 df['canonical_smiles'] = df['canonical_smiles'].apply(lambda s: s.split('.')[0] if s else None)
 
 # Validate SMILES
@@ -87,15 +82,17 @@ def is_valid_smile(s):
 
 df = df[df['canonical_smiles'].apply(is_valid_smile)]
 
-# Find molecules with both endpoints
+# Find molecules with both targets
 grouped = df.groupby('chembl_id')
-common_ids = [chembl_id for chembl_id, grp in grouped
-              if set(grp['endpoint']) == {'herg', 'cyp3a4'}]
+common_ids = [
+    chembl_id for chembl_id, grp in grouped
+    if set(grp['endpoint']) == {'herg', 'cyp3a4'}
+]
 
 # Limit to 300 compounds
 selected_ids = common_ids[:300]
 final_df = df[df['chembl_id'].isin(selected_ids)]
 
-# Save dataset
+# Save the dataset
 final_df.to_csv('dataset.csv', index=False)
-print("dataset.csv has been generated.")
+print("dataset.csv has been saved.")
